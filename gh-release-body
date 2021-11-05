@@ -1,0 +1,53 @@
+#!/usr/bin/env bash
+set -eo pipefail; [[ "$TRACE" ]] && set -x
+
+main() {
+  declare REPO="$1" TAG="$2"
+  local accept_header="Accept: application/vnd.github.v3+json"
+  local github_url="https://api.github.com"
+  local body commit_sha data parent_body parents release_id
+
+  if [[ -z "$GITHUB_ACCESS_TOKEN" ]]; then
+    echo "No GITHUB_ACCESS_TOKEN found in environment" 1>&2
+    return 1
+  fi
+
+  echo "Fetching release id for $REPO#$TAG..."
+  release_id="$(curl -H "$accept_header" -s "$github_url/repos/$REPO/releases/tags/$TAG" | jq -r '.id')"
+
+  echo "Fetching commit sha for release $release_id..."
+  commit_sha="$(curl -H "$accept_header" -s "$github_url/repos/$REPO/tags?per_page=100" | jq --arg tag "$TAG" -r '.[] | select(.name==$tag) | .commit.sha')"
+
+  echo "Fetching default body for commit $commit_sha..."
+  body="$(curl -H "$accept_header" -s "$github_url/repos/$REPO/commits/$commit_sha" | jq -r '.commit.message')"
+
+  if [[ "$body" == "Merge pull request"* ]]; then
+    echo "Detected merge request, fetching parent commits to parse for actual body"
+    parents="$(curl -H "$accept_header" -s "$github_url/repos/$REPO/commits/$commit_sha" | jq -r '.parents')"
+
+    for parent_sha in $(echo "${parents}" | jq -r '.[].sha'); do
+      parent_body="$(curl -H "$accept_header" -s "$github_url/repos/$REPO/commits/$parent_sha" | jq -r '.commit.message')"
+      if [[ "$parent_body" == "Merge pull request"* ]]; then
+        continue
+      fi
+      echo "True message body detected in commit $parent_sha"
+      body="$parent_body"
+    done
+  fi
+
+  if [[ "$body" == "Merge pull request"* ]]; then
+    body="$(echo "$body" | awk 'NR > 2 { print }')";
+  fi
+
+  data="$(jq --null-input --arg body "$body" --arg name "$TAG" '{"body": $body, "name": $name}')"
+
+  echo "Updating $REPO#$TAG..."
+  if curl -H "Authorization: token $GITHUB_ACCESS_TOKEN" -X PATCH -H "$accept_header" -s "$github_url/repos/$REPO/releases/$release_id" -d "$data" >/dev/null; then
+    return 0
+  fi
+
+  echo "Unable to update release body and/or name" 1>&2
+  return 1
+}
+
+main "$@"
